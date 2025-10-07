@@ -1,7 +1,13 @@
 {
-  "name": "limo-app",
+  "name": "limo-api",
   "version": "1.0.0",
   "private": true,
   "scripts": { "start": "node server.js" },
-  "dependencies": { "express": "^4.19.2" }
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5",
+    "helmet": "^7.0.0",
+    "morgan": "^1.10.0",
+    "express-rate-limit": "^7.1.5"
+  }
 }
