@@ -8,6 +8,7 @@
     "cors": "^2.8.5",
     "helmet": "^7.0.0",
     "morgan": "^1.10.0",
+    "engines": { "node": "22.x" }
     "express-rate-limit": "^7.1.5"
   }
 }
