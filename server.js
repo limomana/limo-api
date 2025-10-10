@@ -1,42 +1,137 @@
+// server.js
+'use strict';
+
 const express = require('express');
-const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
+const cors = require('cors');
 
 const app = express();
 
-// ----- config (env-driven) -----
-const PORT = process.env.PORT || 4000;
-// allow your WP site to call the API:
-const ALLOW_ORIGIN = process.env.ALLOW_ORIGIN || 'https://www.limomanagementsys.com.au';
-// basic rate limits (adjust in Render env vars if needed):
-const RATE_LIMIT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS || '60000', 10); // 1 min
-const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX || '120', 10);               // 120 req/min
+/* -------------------- CORS (place FIRST) -------------------- */
+const allowedOrigins = [
+  'https://limomanagementsys.com.au',
+  'https://www.limomanagementsys.com.au',
+];
 
-// ----- middleware -----
-app.use(helmet());
+// help caches vary on Origin so responses aren't mixed
+app.use((req, res, next) => { res.setHeader('Vary', 'Origin'); next(); });
+
+const corsOptions = {
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true); // server-to-server / curl
+    if (allowedOrigins.includes(origin)) return cb(null, true);
+    return cb(new Error('Not allowed by CORS'));
+  },
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'X-Requested-With'],
+  credentials: false,
+  preflightContinue: false,
+  optionsSuccessStatus: 204,
+};
+
+// answer ALL preflights, then apply CORS
+app.options('*', cors(corsOptions));
+app.use(cors(corsOptions));
+
+/* -------------------- Security / parsing / logs -------------------- */
+app.use(helmet({ crossOriginResourcePolicy: false }));
+app.use(express.json({ limit: '1mb' }));
 app.use(morgan('combined'));
-app.use(cors({ origin: [ALLOW_ORIGIN], credentials: true }));
-app.use(express.json());
 
-app.use(rateLimit({
-  windowMs: RATE_LIMIT_WINDOW_MS,
-  max: RATE_LIMIT_MAX,
-  standardHeaders: true,
-  legacyHeaders: false
-}));
+// if behind a proxy/CDN (Render/Cloudflare), trust the first proxy hop
+app.set('trust proxy', 1);
 
-// ----- routes -----
-app.get('/health', (_req, res) => res.status(200).send('ok'));
-app.get('/version', (_req, res) => res.json({ version: '1.0.0' }));
-app.get('/', (_req, res) => res.send('Limo API is up ✅'));
+/* -------------------- Rate limits -------------------- */
+const limiterQuote = rateLimit({ windowMs: 15 * 60 * 1000, max: 60 }); // 60 / 15m
+const limiterBook  = rateLimit({ windowMs: 15 * 60 * 1000, max: 20 }); // 20 / 15m
 
-// example API namespace (start adding real endpoints here)
-app.get('/api/ping', (_req, res) => res.json({ pong: true, at: new Date().toISOString() }));
-
-// ----- start -----
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`listening on ${PORT}`);
+/* -------------------- Routes -------------------- */
+app.get('/', (req, res) => {
+  res.type('text/plain').send('Limo API up');
 });
+
+app.get('/api/ping', (req, res) => {
+  res.json({ pong: true, at: new Date().toISOString() });
+});
+
+app.post('/api/quote', limiterQuote, (req, res) => {
+  const { pickup, dropoff, when, pax, luggage } = req.body || {};
+  if (!pickup || !dropoff || !when) {
+    return res.status(400).json({ ok: false, error: 'pickup, dropoff, and when are required' });
+  }
+
+  // Simple placeholder pricing (tune later)
+  const base = 65;
+  const perKm = 2.2;
+  const perPax = 5 * (Number(pax || 1) - 1);
+  const perBag = 2 * Number(luggage || 0);
+
+  // Temporary "distance" estimate from string lengths until maps API is wired
+  const roughDistance = Math.max(
+    5,
+    Math.min(45, Math.abs(String(pickup).length - String(dropoff).length) + 10)
+  );
+
+  const total = Math.round((base + perKm * roughDistance + perPax + perBag) * 100) / 100;
+
+  return res.json({
+    ok: true,
+    quote: {
+      currency: 'AUD',
+      total,
+      breakdown: { base, perKm, roughDistance, perPax, perBag },
+      pickup,
+      dropoff,
+      when,
+      pax: Number(pax || 1),
+      luggage: Number(luggage || 0),
+    },
+  });
+});
+
+app.post('/api/book', limiterBook, (req, res) => {
+  const { quoteRef, pickup, dropoff, when, pax, luggage, name, email, phone, notes } = req.body || {};
+  if (!pickup || !dropoff || !when || !name || !phone) {
+    return res.status(400).json({ ok: false, error: 'pickup, dropoff, when, name, phone are required' });
+  }
+  const id = 'LM-' + Math.random().toString(36).slice(2, 8).toUpperCase();
+
+  return res.status(201).json({
+    ok: true,
+    booking: {
+      id,
+      quoteRef: quoteRef || null,
+      pickup,
+      dropoff,
+      when,
+      pax: Number(pax || 1),
+      luggage: Number(luggage || 0),
+      name,
+      email: email || null,
+      phone,
+      notes: notes || null,
+      createdAt: new Date().toISOString(),
+    },
+  });
+});
+
+/* -------------------- 404 + error handlers -------------------- */
+app.use((req, res) => {
+  res.status(404).json({ ok: false, error: 'Not found' });
+});
+
+app.use((err, req, res, next) => {
+  // Handle CORS denials cleanly
+  if (err && err.message && /CORS/i.test(err.message)) {
+    return res.status(403).json({ ok: false, error: 'CORS: origin not allowed' });
+  }
+  console.error('Unhandled error:', err);
+  res.status(500).json({ ok: false, error: 'Internal server error' });
+});
+
+/* -------------------- Listen -------------------- */
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log(`API listening on ${PORT}`));
 
