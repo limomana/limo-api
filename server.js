@@ -8,6 +8,35 @@ const express = require('express');            // ← only once
 const app = express();
 app.use(express.json());
 
+// ==== AUTH GUARD (single source of truth) ====
+const SERVER_KEY = (process.env.LMS_API_KEY || '').trim();
+
+// one-time startup sanity print (safe: no key value)
+console.log(
+  'LMS_API_KEY present:', Boolean(SERVER_KEY),
+  'len:', SERVER_KEY.length
+);
+
+app.use((req, res, next) => {
+  // Only accept the header name LMS_API_KEY
+  const clientKey = (req.get('LMS_API_KEY') || '').trim();
+
+  // lightweight visibility without leaking the key
+  console.log('[auth]',
+    'headerPresent=', Boolean(clientKey),
+    'headerLen=', clientKey.length,
+    'valid=', clientKey === SERVER_KEY
+  );
+
+  if (!SERVER_KEY) {
+    return res.status(500).json({ ok:false, error:'Server key not configured' });
+  }
+  if (clientKey !== SERVER_KEY) {
+    return res.status(401).json({ ok:false, error:'Unauthorized' });
+  }
+  next();
+});
+
 // --- Config / Env ---
 const PORT       = process.env.PORT || 10000;
 const API_KEY    = (process.env.LMS_API_KEY || '').trim();
