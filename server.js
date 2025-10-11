@@ -1,28 +1,25 @@
 // server.js
 'use strict';
 
-const express = require('express');
-const helmet = require('helmet');
-const morgan = require('morgan');
+const express   = require('express');
+const helmet    = require('helmet');
+const morgan    = require('morgan');
 const rateLimit = require('express-rate-limit');
-const cors = require('cors');
+const cors      = require('cors');
 
 const app = express();
 
-/* -------------------- CORS (place FIRST) -------------------- */
+/* -------------------- CORS (FIRST) -------------------- */
 const allowedOrigins = [
   'https://limomanagementsys.com.au',
   'https://www.limomanagementsys.com.au',
 ];
-
-// help caches vary on Origin so responses aren't mixed
 app.use((req, res, next) => { res.setHeader('Vary', 'Origin'); next(); });
-
 const corsOptions = {
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true); // server-to-server / curl
+    if (!origin) return cb(null, true);               // server-to-server
     if (allowedOrigins.includes(origin)) return cb(null, true);
-    return cb(new Error('Not allowed by CORS'));
+    cb(new Error('Not allowed by CORS'));
   },
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'X-Requested-With'],
@@ -30,8 +27,6 @@ const corsOptions = {
   preflightContinue: false,
   optionsSuccessStatus: 204,
 };
-
-// answer ALL preflights, then apply CORS
 app.options('*', cors(corsOptions));
 app.use(cors(corsOptions));
 
@@ -39,55 +34,153 @@ app.use(cors(corsOptions));
 app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('combined'));
-
-// if behind a proxy/CDN (Render/Cloudflare), trust the first proxy hop
 app.set('trust proxy', 1);
 
 /* -------------------- Rate limits -------------------- */
-const limiterQuote = rateLimit({ windowMs: 15 * 60 * 1000, max: 60 }); // 60 / 15m
-const limiterBook  = rateLimit({ windowMs: 15 * 60 * 1000, max: 20 }); // 20 / 15m
+const limiterQuote = rateLimit({ windowMs: 15 * 60 * 1000, max: 60 });
+const limiterBook  = rateLimit({ windowMs: 15 * 60 * 1000, max: 20 });
+
+/* -------------------- Config (Distance Matrix + pricing) -------------------- */
+const GMAPS_KEY = process.env.GOOGLE_MAPS_KEY || process.env.GMAPS_KEY;
+
+const PRICING = {
+  base:   Number(process.env.PRICE_BASE     || 65),
+  perKm:  Number(process.env.PRICE_PER_KM   || 2.2),
+  perMin: Number(process.env.PRICE_PER_MIN  || 0.8),
+  perPax: Number(process.env.PRICE_PER_PAX  || 5),
+  perBag: Number(process.env.PRICE_PER_BAG  || 2),
+};
+const SURCHARGES = {
+  afterHoursStart: process.env.AFTER_HOURS_START || '22:00',
+  afterHoursEnd:   process.env.AFTER_HOURS_END   || '05:00',
+  afterHoursRate:  Number(process.env.AFTER_HOURS_RATE || 0.10),
+  airportFee:      Number(process.env.AIRPORT_SURCHARGE || 0),
+};
+
+// simple 12h cache for matrix results
+const _cache = new Map();
+const _TTL_MS = 12 * 60 * 60 * 1000;
+const _key = (a,b) => `${a}||${b}`.toLowerCase();
+const _get = (a,b) => {
+  const v = _cache.get(_key(a,b));
+  if (!v) return null;
+  if (Date.now() - v.t > _TTL_MS) { _cache.delete(_key(a,b)); return null; }
+  return v.data;
+};
+const _set = (a,b,data) => _cache.set(_key(a,b), { t: Date.now(), data });
+
+// helpers
+function isAfterHours(dtISO){
+  try {
+    const d = dtISO ? new Date(dtISO) : new Date();
+    const [sH,sM] = (process.env.AFTER_HOURS_START || SURCHARGES.afterHoursStart).split(':').map(Number);
+    const [eH,eM] = (process.env.AFTER_HOURS_END   || SURCHARGES.afterHoursEnd).split(':').map(Number);
+    const mins = d.getHours()*60 + d.getMinutes();
+    const start = sH*60 + sM, end = eH*60 + eM;
+    return start <= end ? (mins >= start && mins < end) : (mins >= start || mins < end);
+  } catch { return false; }
+}
+const looksLikeAirport = s => /airport|bne|brisbane\s*airport/i.test(String(s||''));
 
 /* -------------------- Routes -------------------- */
-app.get('/', (req, res) => {
-  res.type('text/plain').send('Limo API up');
-});
+app.get('/', (req, res) => res.type('text/plain').send('Limo API up'));
 
 app.get('/api/ping', (req, res) => {
   res.json({ pong: true, at: new Date().toISOString() });
 });
 
-app.post('/api/quote', limiterQuote, (req, res) => {
+app.post('/api/quote', limiterQuote, async (req, res) => {
   const { pickup, dropoff, when, pax, luggage } = req.body || {};
   if (!pickup || !dropoff || !when) {
     return res.status(400).json({ ok: false, error: 'pickup, dropoff, and when are required' });
   }
 
-  // Simple placeholder pricing (tune later)
-  const base = 65;
-  const perKm = 2.2;
-  const perPax = 5 * (Number(pax || 1) - 1);
-  const perBag = 2 * Number(luggage || 0);
+  let km=null, mins=null, src='cache';
+  const cached = _get(pickup, dropoff);
+  if (cached) { km=cached.km; mins=cached.mins; }
 
-  // Temporary "distance" estimate from string lengths until maps API is wired
-  const roughDistance = Math.max(
-    5,
-    Math.min(45, Math.abs(String(pickup).length - String(dropoff).length) + 10)
-  );
+  if (!km || !mins) {
+    try {
+      if (!GMAPS_KEY) throw new Error('Missing GOOGLE_MAPS_KEY');
+      const url = new URL('https://maps.googleapis.com/maps/api/distancematrix/json');
+      url.searchParams.set('origins', pickup);
+      url.searchParams.set('destinations', dropoff);
+      url.searchParams.set('mode', 'driving');
+      url.searchParams.set('departure_time', 'now');
+      url.searchParams.set('key', GMAPS_KEY);
 
-  const total = Math.round((base + perKm * roughDistance + perPax + perBag) * 100) / 100;
+      const resp = await fetch(url.toString());
+      const data = await resp.json();
+      const el = data?.rows?.[0]?.elements?.[0];
+      if (resp.ok && el && el.status === 'OK') {
+        const meters  = Number(el.distance?.value || 0);
+        const seconds = Number((el.duration_in_traffic || el.duration)?.value || 0);
+        km   = meters / 1000;
+        mins = seconds / 60;
+        src = 'google';
+        _set(pickup, dropoff, { km, mins });
+        console.log(`matrix ok: ${km.toFixed(1)} km, ${Math.round(mins)} min`);
+      } else {
+        throw new Error(`Matrix error: ${el?.status || data?.status || resp.status}`);
+      }
+    } catch (e) {
+      console.error('Distance Matrix failed, using fallback:', e.message);
+      const roughDistance = Math.max(5,
+        Math.min(45, Math.abs(String(pickup).length - String(dropoff).length) + 10));
+      km = roughDistance;
+      mins = roughDistance * 2;
+      src = 'fallback';
+    }
+  }
+
+  // price
+  const pPax = PRICING.perPax * Math.max(0, Number(pax || 1) - 1);
+  const pBag = PRICING.perBag * Math.max(0, Number(luggage || 0));
+  const compBase = PRICING.base;
+  const compKm   = PRICING.perKm  * km;
+  const compMin  = PRICING.perMin * mins;
+
+  let subtotal = compBase + compKm + compMin + pPax + pBag;
+  const components = {
+    base: compBase,
+    perKm: Math.round(compKm * 100) / 100,
+    perMin: Math.round(compMin * 100) / 100,
+    pPax,
+    pBag,
+  };
+
+  if (isAfterHours(when)) {
+    const extra = subtotal * (Number(process.env.AFTER_HOURS_RATE) || SURCHARGES.afterHoursRate);
+    subtotal += extra;
+    components.afterHours = Math.round(extra * 100) / 100;
+  }
+  if (SURCHARGES.airportFee && (looksLikeAirport(pickup) || looksLikeAirport(dropoff))) {
+    subtotal += SURCHARGES.airportFee;
+    components.airport = SURCHARGES.airportFee;
+  }
+
+  const total = Math.round(subtotal * 100) / 100;
 
   return res.json({
     ok: true,
     quote: {
       currency: 'AUD',
       total,
-      breakdown: { base, perKm, roughDistance, perPax, perBag },
-      pickup,
-      dropoff,
-      when,
+      distance_km: Math.round(km * 100) / 100,
+      duration_min: Math.round(mins),
+      source: src,
+      breakdown: {
+        base: PRICING.base,
+        perKm: PRICING.perKm,
+        perMin: PRICING.perMin,
+        perPax: PRICING.perPAX || PRICING.perPax,
+        perBag: PRICING.perBag,
+        components
+      },
+      pickup, dropoff, when,
       pax: Number(pax || 1),
       luggage: Number(luggage || 0),
-    },
+    }
   });
 });
 
@@ -97,34 +190,23 @@ app.post('/api/book', limiterBook, (req, res) => {
     return res.status(400).json({ ok: false, error: 'pickup, dropoff, when, name, phone are required' });
   }
   const id = 'LM-' + Math.random().toString(36).slice(2, 8).toUpperCase();
-
   return res.status(201).json({
     ok: true,
     booking: {
-      id,
-      quoteRef: quoteRef || null,
-      pickup,
-      dropoff,
-      when,
+      id, quoteRef: quoteRef || null,
+      pickup, dropoff, when,
       pax: Number(pax || 1),
       luggage: Number(luggage || 0),
-      name,
-      email: email || null,
-      phone,
-      notes: notes || null,
+      name, email: email || null, phone, notes: notes || null,
       createdAt: new Date().toISOString(),
     },
   });
 });
 
-/* -------------------- 404 + error handlers -------------------- */
-app.use((req, res) => {
-  res.status(404).json({ ok: false, error: 'Not found' });
-});
-
+/* -------------------- 404 + errors -------------------- */
+app.use((req, res) => res.status(404).json({ ok: false, error: 'Not found' }));
 app.use((err, req, res, next) => {
-  // Handle CORS denials cleanly
-  if (err && err.message && /CORS/i.test(err.message)) {
+  if (err && /CORS/i.test(err.message)) {
     return res.status(403).json({ ok: false, error: 'CORS: origin not allowed' });
   }
   console.error('Unhandled error:', err);
@@ -134,4 +216,3 @@ app.use((err, req, res, next) => {
 /* -------------------- Listen -------------------- */
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`API listening on ${PORT}`));
-
