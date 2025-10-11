@@ -8,6 +8,15 @@ const rateLimit = require('express-rate-limit');
 const cors = require('cors');
 
 const app = express();
+// Express middleware
+function requireApiKey(req, res, next) {
+  const expected = process.env.LMS_API_KEY;
+  if (!expected) return next(); // not enforcing if unset
+  if (req.get('X-Api-Key') !== expected) {
+    return res.status(401).json({ ok:false, error:'Invalid API key' });
+  }
+  next();
+}
 
 /* -------------------- CORS (place FIRST) -------------------- */
 const allowedOrigins = [
