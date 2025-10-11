@@ -1,25 +1,26 @@
 // server.js
 'use strict';
 
-const express   = require('express');
-const helmet    = require('helmet');
-const morgan    = require('morgan');
+const express = require('express');
+const helmet = require('helmet');
+const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
-const cors      = require('cors');
+const cors = require('cors');
 
 const app = express();
 
-/* -------------------- CORS (FIRST) -------------------- */
+/* -------------------- CORS (place FIRST) -------------------- */
 const allowedOrigins = [
   'https://limomanagementsys.com.au',
   'https://www.limomanagementsys.com.au',
 ];
 app.use((req, res, next) => { res.setHeader('Vary', 'Origin'); next(); });
+
 const corsOptions = {
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true);               // server-to-server
+    if (!origin) return cb(null, true);
     if (allowedOrigins.includes(origin)) return cb(null, true);
-    cb(new Error('Not allowed by CORS'));
+    return cb(new Error('Not allowed by CORS'));
   },
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'X-Requested-With'],
@@ -40,7 +41,7 @@ app.set('trust proxy', 1);
 const limiterQuote = rateLimit({ windowMs: 15 * 60 * 1000, max: 60 });
 const limiterBook  = rateLimit({ windowMs: 15 * 60 * 1000, max: 20 });
 
-/* -------------------- Config (Distance Matrix + pricing) -------------------- */
+/* -------------------- Pricing & Google config -------------------- */
 const GMAPS_KEY = process.env.GOOGLE_MAPS_KEY || process.env.GMAPS_KEY;
 
 const PRICING = {
@@ -50,6 +51,7 @@ const PRICING = {
   perPax: Number(process.env.PRICE_PER_PAX  || 5),
   perBag: Number(process.env.PRICE_PER_BAG  || 2),
 };
+
 const SURCHARGES = {
   afterHoursStart: process.env.AFTER_HOURS_START || '22:00',
   afterHoursEnd:   process.env.AFTER_HOURS_END   || '05:00',
@@ -57,24 +59,23 @@ const SURCHARGES = {
   airportFee:      Number(process.env.AIRPORT_SURCHARGE || 0),
 };
 
-// simple 12h cache for matrix results
+// very small 12h in-memory cache for distance matrix results
 const _cache = new Map();
 const _TTL_MS = 12 * 60 * 60 * 1000;
 const _key = (a,b) => `${a}||${b}`.toLowerCase();
 const _get = (a,b) => {
   const v = _cache.get(_key(a,b));
   if (!v) return null;
-  if (Date.now() - v.t > _TTL_MS) { _cache.delete(_key(a,b)); return null; }
+  if (Date.now()-v.t > _TTL_MS) { _cache.delete(_key(a,b)); return null; }
   return v.data;
 };
 const _set = (a,b,data) => _cache.set(_key(a,b), { t: Date.now(), data });
 
-// helpers
 function isAfterHours(dtISO){
   try {
     const d = dtISO ? new Date(dtISO) : new Date();
-    const [sH,sM] = (process.env.AFTER_HOURS_START || SURCHARGES.afterHoursStart).split(':').map(Number);
-    const [eH,eM] = (process.env.AFTER_HOURS_END   || SURCHARGES.afterHoursEnd).split(':').map(Number);
+    const [sH,sM] = (process.env.TZ ? SURCHARGES.afterHoursStart : SURCHARGES.afterHoursStart).split(':').map(Number);
+    const [eH,eM] = SURCHARGES.afterHoursEnd.split(':').map(Number);
     const mins = d.getHours()*60 + d.getMinutes();
     const start = sH*60 + sM, end = eH*60 + eM;
     return start <= end ? (mins >= start && mins < end) : (mins >= start || mins < end);
@@ -83,11 +84,8 @@ function isAfterHours(dtISO){
 const looksLikeAirport = s => /airport|bne|brisbane\s*airport/i.test(String(s||''));
 
 /* -------------------- Routes -------------------- */
-app.get('/', (req, res) => res.type('text/plain').send('Limo API up'));
-
-app.get('/api/ping', (req, res) => {
-  res.json({ pong: true, at: new Date().toISOString() });
-});
+app.get('/', (_, res) => res.type('text/plain').send('Limo API up'));
+app.get('/api/ping', (_, res) => res.json({ pong: true, at: new Date().toISOString() }));
 
 app.post('/api/quote', limiterQuote, async (req, res) => {
   const { pickup, dropoff, when, pax, luggage } = req.body || {};
@@ -95,9 +93,9 @@ app.post('/api/quote', limiterQuote, async (req, res) => {
     return res.status(400).json({ ok: false, error: 'pickup, dropoff, and when are required' });
   }
 
-  let km=null, mins=null, src='cache';
+  let km = null, mins = null, source = 'cache';
   const cached = _get(pickup, dropoff);
-  if (cached) { km=cached.km; mins=cached.mins; }
+  if (cached) { km = cached.km; mins = cached.mins; }
 
   if (!km || !mins) {
     try {
@@ -117,7 +115,7 @@ app.post('/api/quote', limiterQuote, async (req, res) => {
         const seconds = Number((el.duration_in_traffic || el.duration)?.value || 0);
         km   = meters / 1000;
         mins = seconds / 60;
-        src = 'google';
+        source = 'google';
         _set(pickup, dropoff, { km, mins });
         console.log(`matrix ok: ${km.toFixed(1)} km, ${Math.round(mins)} min`);
       } else {
@@ -125,38 +123,33 @@ app.post('/api/quote', limiterQuote, async (req, res) => {
       }
     } catch (e) {
       console.error('Distance Matrix failed, using fallback:', e.message);
+      // fallback: older rough estimate
       const roughDistance = Math.max(5,
         Math.min(45, Math.abs(String(pickup).length - String(dropoff).length) + 10));
       km = roughDistance;
       mins = roughDistance * 2;
-      src = 'fallback';
+      source = 'fallback';
     }
   }
 
   // price
   const pPax = PRICING.perPax * Math.max(0, Number(pax || 1) - 1);
   const pBag = PRICING.perBag * Math.max(0, Number(luggage || 0));
-  const compBase = PRICING.base;
-  const compKm   = PRICING.perKm  * km;
-  const compMin  = PRICING.perMin * mins;
+  const base = PRICING.base;
+  const perKmCost  = PRICING.perKm  * km;
+  const perMinCost = PRICING.perMin * mins;
 
-  let subtotal = compBase + compKm + compMin + pPax + pBag;
-  const components = {
-    base: compBase,
-    perKm: Math.round(compKm * 100) / 100,
-    perMin: Math.round(compMin * 100) / 100,
-    pPax,
-    pBag,
-  };
+  let subtotal = base + perKmCost + perMinCost + pPax + pBag;
+  let surcharges = {};
 
   if (isAfterHours(when)) {
-    const extra = subtotal * (Number(process.env.AFTER_HOURS_RATE) || SURCHARGES.afterHoursRate);
+    const extra = subtotal * SURCHARGES.afterHoursRate;
     subtotal += extra;
-    components.afterHours = Math.round(extra * 100) / 100;
+    surcharges.afterHours = Math.round(extra * 100) / 100;
   }
   if (SURCHARGES.airportFee && (looksLikeAirport(pickup) || looksLikeAirport(dropoff))) {
     subtotal += SURCHARGES.airportFee;
-    components.airport = SURCHARGES.airportFee;
+    surcharges.airport = SURCHARGES.airportFee;
   }
 
   const total = Math.round(subtotal * 100) / 100;
@@ -168,19 +161,26 @@ app.post('/api/quote', limiterQuote, async (req, res) => {
       total,
       distance_km: Math.round(km * 100) / 100,
       duration_min: Math.round(mins),
-      source: src,
+      source,
       breakdown: {
         base: PRICING.base,
         perKm: PRICING.perKm,
         perMin: PRICING.perMin,
-        perPax: PRICING.perPAX || PRICING.perPax,
+        perPax: PRICING.perPax,
         perBag: PRICING.perBag,
-        components
+        components: {
+          base,
+          perKm: Math.round(perKmCost * 100) / 100,
+          perMin: Math.round(perMinCost * 100) / 100,
+          pPax,
+          pBag,
+          ...surcharges
+        }
       },
       pickup, dropoff, when,
       pax: Number(pax || 1),
       luggage: Number(luggage || 0),
-    }
+    },
   });
 });
 
@@ -203,10 +203,10 @@ app.post('/api/book', limiterBook, (req, res) => {
   });
 });
 
-/* -------------------- 404 + errors -------------------- */
+/* -------------------- 404 + error handlers -------------------- */
 app.use((req, res) => res.status(404).json({ ok: false, error: 'Not found' }));
 app.use((err, req, res, next) => {
-  if (err && /CORS/i.test(err.message)) {
+  if (err && err.message && /CORS/i.test(err.message)) {
     return res.status(403).json({ ok: false, error: 'CORS: origin not allowed' });
   }
   console.error('Unhandled error:', err);
