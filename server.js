@@ -5,6 +5,15 @@ const express = require('express');
 
 const app = express();
 app.use(express.json());
+const API_KEY  = (process.env.LMS_API_KEY || '').trim();
+const MAPS_KEY = (process.env.GOOGLE_MAPS_KEY || '').trim();
+
+console.log(
+  'LMS_API_KEY present:', Boolean(API_KEY),
+  'len:', API_KEY.length,
+  'GOOGLE_MAPS_KEY present:', Boolean(MAPS_KEY),
+  'len:', MAPS_KEY.length
+);
 
 // ----- config / env -----
 const PORT = process.env.PORT || 3000;
