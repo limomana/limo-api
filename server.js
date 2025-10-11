@@ -32,13 +32,21 @@ app.use((req, _res, next) => {
   next();
 });
 
-// ---- API key guard (enable only if LMS_API_KEY is set)
-app.use((req, res, next) => {
-  const requiredKey = process.env.LMS_API_KEY;
-  if (!requiredKey) return next(); // no key set -> bypass
-  const provided = req.get('X-Api-Key');
-  if (provided !== requiredKey) {
-    return res.status(401).json({ ok: false, error: 'Invalid API key' });
+// --- API key guard (before /api routes) ---
+const EXPECTED_KEY = (process.env.LMS_API_KEY || '').trim();
+
+app.use('/api', (req, res, next) => {
+  const provided = (req.get('x-api-key') || '').trim(); // header names are lowercased by Express
+  if (!EXPECTED_KEY) {
+    console.error('LMS_API_KEY is NOT set on the server');
+    return res.status(500).json({ ok: false, error: 'Server misconfigured' });
+  }
+  if (provided !== EXPECTED_KEY) {
+    console.warn('401 Unauthorized', {
+      debugId: req.get('x-debug-id') || null,
+      providedLen: provided.length,
+    });
+    return res.status(401).json({ ok: false, error: 'Unauthorized' });
   }
   next();
 });
