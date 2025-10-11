@@ -5,6 +5,9 @@
 const express = require('express');
 const cors = require('cors');
 
+console.log('LMS_API_KEY present:', Boolean(process.env.LMS_API_KEY), 
+            'len:', (process.env.LMS_API_KEY || '').trim().length);
+
 // ---- App
 const app = express();
 const PORT = process.env.PORT || 10000;
