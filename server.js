@@ -8,6 +8,20 @@ const rateLimit = require('express-rate-limit');
 const cors = require('cors');
 
 const app = express();
+// --- safe fetch + timeout helper ---
+const doFetch = typeof fetch === 'function'
+  ? fetch
+  : (...args) => import('node-fetch').then(({ default: f }) => f(...args));
+
+async function fetchWithTimeout(url, { timeoutMs = Number(process.env.MAPS_TIMEOUT_MS || 4000), ...opts } = {}) {
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    return await doFetch(url, { ...opts, signal: ac.signal });
+  } finally {
+    clearTimeout(t);
+  }
+}
 
 /* -------------------- CORS (place FIRST) -------------------- */
 const allowedOrigins = [
