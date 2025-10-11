@@ -8,6 +8,34 @@ const express = require('express');            // ← only once
 const app = express();
 app.use(express.json());
 
+const crypto = require('crypto');
+
+// Single source of truth
+const SERVER_KEY = (process.env.LMS_API_KEY || '').trim();
+const serverFp = SERVER_KEY ? crypto.createHash('sha256').update(SERVER_KEY).digest('hex').slice(0, 12) : 'none';
+
+console.log('Auth startup:',
+  'LMS_API_KEY present=', Boolean(SERVER_KEY),
+  'len=', SERVER_KEY.length,
+  'fp=', serverFp
+);
+
+app.use((req, res, next) => {
+  const clientKey = (req.get('LMS_API_KEY') || '').trim();
+  const clientFp = clientKey ? crypto.createHash('sha256').update(clientKey).digest('hex').slice(0, 12) : 'none';
+
+  console.log('[auth]',
+    'clientPresent=', Boolean(clientKey),
+    'clientLen=', clientKey.length,
+    'clientFp=', clientFp,
+    'match=', clientKey === SERVER_KEY
+  );
+
+  if (!SERVER_KEY) return res.status(500).json({ ok:false, error:'Server key not configured' });
+  if (clientKey !== SERVER_KEY) return res.status(401).json({ ok:false, error:'Unauthorized' });
+  next();
+});
+
 // ==== AUTH GUARD (single source of truth) ====
 const SERVER_KEY = (process.env.LMS_API_KEY || '').trim();
 
@@ -35,6 +63,20 @@ app.use((req, res, next) => {
     return res.status(401).json({ ok:false, error:'Unauthorized' });
   }
   next();
+});
+
+app.get('/api/diag/auth', (req, res) => {
+  const clientKey = (req.get('LMS_API_KEY') || '').trim();
+  res.json({
+    ok: true,
+    serverKeyPresent: Boolean(SERVER_KEY),
+    serverKeyLen: SERVER_KEY.length,
+    serverKeyFp: serverFp,
+    clientKeyPresent: Boolean(clientKey),
+    clientKeyLen: clientKey.length,
+    clientKeyFp: clientKey ? crypto.createHash('sha256').update(clientKey).digest('hex').slice(0,12) : null,
+    match: clientKey === SERVER_KEY
+  });
 });
 
 // --- Config / Env ---
