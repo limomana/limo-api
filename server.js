@@ -10,11 +10,11 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'https://limomanagementsys.com.au';
 const EXPECTED_KEY = (process.env.LMS_API_KEY || '').trim();
-const GOOGLE_MAPS_API_KEY = (process.env.GOOGLE_MAPS_API_KEY || '').trim();
+const GOOGLE_MAPS_KEY = (process.env.GOOGLE_MAPS_KEY || '').trim();
 
 // A little startup visibility (does NOT print secrets)
 console.log('LMS_API_KEY present:', !!EXPECTED_KEY, 'len:', EXPECTED_KEY.length);
-console.log('GOOGLE_MAPS_API_KEY present:', !!GOOGLE_MAPS_API_KEY);
+console.log('GOOGLE_MAPS_KEY present:', !!GOOGLE_MAPS_KEY);
 
 // ----- very light CORS (allow your site) -----
 app.use((req, res, next) => {
@@ -58,7 +58,7 @@ app.use('/api', (req, res, next) => {
 // ----- helpers -----
 async function getDistanceKmAndDuration(pickup, dropoff) {
   // If a Google key is available, use Distance Matrix with textual origins/destinations.
-  if (GOOGLE_MAPS_API_KEY) {
+  if (GOOGLE_MAPS_KEY) {
     try {
       const params = new URLSearchParams({
         origins: pickup,
