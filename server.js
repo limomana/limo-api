@@ -96,6 +96,34 @@ function isAfterHours(dtISO){
   } catch { return false; }
 }
 const looksLikeAirport = s => /airport|bne|brisbane\s*airport/i.test(String(s||''));
+/* -------------------- Distance helpers (Google Distance Matrix) -------------------- */
+async function fetchJsonWithTimeout(url, ms = 5000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  const res = await fetch(url, { signal: ctrl.signal });
+  clearTimeout(timer);
+  return res.json();
+}
+
+async function getDistanceKmAndMinutes(pickup, dropoff) {
+  if (!GOOGLE_MAPS_KEY) return null;
+
+  const url =
+    'https://maps.googleapis.com/maps/api/distancematrix/json' +
+    `?units=metric&origins=${encodeURIComponent(pickup)}` +
+    `&destinations=${encodeURIComponent(dropoff)}` +
+    `&departure_time=now&key=${GOOGLE_MAPS_KEY}`;
+
+  const data = await fetchJsonWithTimeout(url, 6000);
+
+  if (data.status !== 'OK') return null;
+  const el = data?.rows?.[0]?.elements?.[0];
+  if (!el || el.status !== 'OK') return null;
+
+  const km = el.distance.value / 1000;
+  const minutes = Math.round(((el.duration_in_traffic?.value ?? el.duration.value) || 0) / 60);
+  return { km, minutes };
+}
 
 /* -------------------- Routes -------------------- */
 app.get('/', (_, res) => res.type('text/plain').send('Limo API up'));
