@@ -17,6 +17,27 @@ function requireApiKey(req, res, next) {
   }
   next();
 }
+const express = require('express');
+const app = express();
+
+app.use(express.json());
+
+const REQUIRED_KEY = process.env.LMS_API_KEY;
+if (!REQUIRED_KEY) {
+  console.error('LMS_API_KEY is NOT set – requests will be rejected');
+}
+
+/** Enforce API key on ALL /api routes */
+app.use('/api', (req, res, next) => {
+  const key = req.get('x-api-key'); // headers are case-insensitive
+  if (!REQUIRED_KEY || key !== REQUIRED_KEY) {
+    return res.status(401).json({ ok: false, error: 'Invalid API key' });
+  }
+  next();
+});
+
+// …then your routes:
+app.post('/api/quote', (req, res) => { /* existing handler */ });
 
 /* -------------------- CORS (place FIRST) -------------------- */
 const allowedOrigins = [
