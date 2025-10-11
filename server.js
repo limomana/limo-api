@@ -1,157 +1,170 @@
-// server.js
 'use strict';
 
-const express = require('express');
+// --- Optional: load .env locally (won't crash if not installed) ---
+try { require('dotenv').config(); } catch (_) {}
 
+// --- Core ---
+const express = require('express');            // ← only once
 const app = express();
 app.use(express.json());
-const API_KEY  = (process.env.LMS_API_KEY || '').trim();
-const MAPS_KEY = (process.env.GOOGLE_MAPS_KEY || '').trim();
 
+// --- Config / Env ---
+const PORT       = process.env.PORT || 10000;
+const API_KEY    = (process.env.LMS_API_KEY || '').trim();
+const MAPS_KEY   = (process.env.GOOGLE_MAPS_KEY || '').trim();
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'https://limomanagementsys.com.au';
+
+// One-time startup visibility (mask values)
 console.log(
-  'LMS_API_KEY present:', Boolean(API_KEY),
-  'len:', API_KEY.length,
-  'GOOGLE_MAPS_KEY present:', Boolean(MAPS_KEY),
-  'len:', MAPS_KEY.length
+  'LMS_API_KEY present:', Boolean(API_KEY), 'len:', API_KEY.length,
+  'GOOGLE_MAPS_KEY present:', Boolean(MAPS_KEY), 'len:', MAPS_KEY.length
 );
 
-// ----- config / env -----
-const PORT = process.env.PORT || 3000;
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'https://limomanagementsys.com.au';
-const EXPECTED_KEY = (process.env.LMS_API_KEY || '').trim();
-const GOOGLE_MAPS_KEY = (process.env.GOOGLE_MAPS_KEY || '').trim();
-
-// A little startup visibility (does NOT print secrets)
-console.log('LMS_API_KEY present:', !!EXPECTED_KEY, 'len:', EXPECTED_KEY.length);
-console.log('GOOGLE_MAPS_KEY present:', !!GOOGLE_MAPS_KEY);
-
-// ----- very light CORS (allow your site) -----
+// --- Minimal CORS (match your site) ---
 app.use((req, res, next) => {
-  res.set('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
-  res.set('Vary', 'Origin');
-  res.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.set('Access-Control-Allow-Headers', 'Content-Type, LMS-Api-Key, X-Api-Key, X-Debug-ID');
+  res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, LMS-Api-Key, X-Debug-ID');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
-// Optional: log a per-request debug id if client sends one
-app.use((req, _res, next) => {
-  const did = req.get('X-Debug-ID');
-  if (did) console.log(`[${new Date().toISOString()}] req ${req.method} ${req.originalUrl} debug=${did}`);
-  next();
-});
-
-// ----- health -----
+// --- Health ---
 app.get('/api/ping', (req, res) => {
   res.json({
     pong: true,
     at: new Date().toISOString(),
-    mapsConfigured: !!GOOGLE_MAPS_API_KEY
+    mapsConfigured: Boolean(MAPS_KEY)
   });
 });
 
-// ----- API key guard (protect everything under /api EXCEPT /api/ping) -----
-app.use('/api', (req, res, next) => {
-  if (req.path === '/ping') return next(); // leave ping open
-  if (!EXPECTED_KEY) {
-    return res.status(500).json({ ok: false, error: 'Server misconfigured (LMS_API_KEY missing)' });
-  }
-  const provided = (req.get('LMS-Api-Key') || req.get('X-Api-Key') || '').trim();
-  if (provided !== EXPECTED_KEY) {
-    return res.status(401).json({ ok: false, error: 'Unauthorized' });
-  }
-  next();
-});
+// --- Helpers ---
+function round2(n) { return Math.round(n * 100) / 100; }
 
-// ----- helpers -----
-async function getDistanceKmAndDuration(pickup, dropoff) {
-  // If a Google key is available, use Distance Matrix with textual origins/destinations.
-  if (GOOGLE_MAPS_KEY) {
-    try {
-      const params = new URLSearchParams({
-        origins: pickup,
-        destinations: dropoff,
-        units: 'metric',
-        key: GOOGLE_MAPS_API_KEY
-      });
-      const url = 'https://maps.googleapis.com/maps/api/distancematrix/json?' + params.toString();
-      const resp = await fetch(url);
-      const data = await resp.json();
+function roughDistanceKm(pickup, dropoff) {
+  // Simple fallback when no Google Maps key is configured or API fails.
+  const p = (pickup || '').toLowerCase();
+  const d = (dropoff || '').toLowerCase();
 
-      if (data.status === 'OK' &&
-          data.rows &&
-          data.rows[0] &&
-          data.rows[0].elements &&
-          data.rows[0].elements[0] &&
-          data.rows[0].elements[0].status === 'OK') {
-        const el = data.rows[0].elements[0];
-        const distanceKm = (el.distance.value || 0) / 1000; // meters -> km
-        const durationMin = Math.round((el.duration.value || 0) / 60); // secs -> mins
-        return { distanceKm, durationMin, distanceSource: 'google' };
-      }
-      console.warn('DistanceMatrix returned non-OK:', JSON.stringify(data));
-    } catch (e) {
-      console.warn('DistanceMatrix error:', e);
-    }
+  // Your common lane:
+  if (p.includes('brisbane airport') && d.includes('south bank') ||
+      d.includes('brisbane airport') && p.includes('south bank')) {
+    return 16; // matches earlier results
   }
-
-  // Fallback rough guess if Google failed/not configured
-  return { distanceKm: 16, durationMin: null, distanceSource: 'rough' };
+  return 10;   // generic fallback
 }
 
-function priceFrom(distanceKm, pax, luggage) {
-  const base = 65;
-  const perKm = 2.2;
-  const perPax = 5;   // charged for extra passengers after the first
+async function googleDistanceKmAndMinutes(pickup, dropoff) {
+  // Uses Google Directions API (driving) via global fetch (Node 18+)
+  const params = new URLSearchParams({
+    origin: pickup,
+    destination: dropoff,
+    mode: 'driving',
+    key: MAPS_KEY
+  });
+  const url = `https://maps.googleapis.com/maps/api/directions/json?${params.toString()}`;
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`Google HTTP ${resp.status}`);
+  const data = await resp.json();
+
+  if (!data.routes || !data.routes.length) {
+    throw new Error('No routes returned');
+  }
+  const leg = data.routes[0].legs && data.routes[0].legs[0];
+  if (!leg || !leg.distance || !leg.duration) {
+    throw new Error('No legs/distance/duration');
+  }
+  const distanceKm  = leg.distance.value / 1000; // meters → km
+  const durationMin = Math.round(leg.duration.value / 60); // seconds → minutes
+  return { distanceKm, durationMin };
+}
+
+function priceQuote({ distanceKm, pax, luggage }) {
+  // Pricing model:
+  // base = 65
+  // perKm = 2.2
+  // perPax = 5 (for each pax *beyond the first*)
+  // perBag = 2 (per bag)
+  const base   = 65;
+  const perKm  = 2.2;
+  const perPax = 5;
   const perBag = 2;
 
-  const extraPax = Math.max((Number(pax) || 0) - 1, 0);
-  const bags = Number(luggage) || 0;
+  const extraPax = Math.max(0, (Number(pax) || 0) - 1);
+  const bags     = Math.max(0, Number(luggage) || 0);
 
   const total = base + (perKm * distanceKm) + (perPax * extraPax) + (perBag * bags);
-  return {
-    total: Number(total.toFixed(2)),
-    breakdown: {
-      base, perKm, distanceKm: Number(distanceKm.toFixed(3)),
-      distanceSource: null, // fill by caller
-      perPax, perBag,
-      durationMin: null     // fill by caller
-    }
-  };
+  return round2(total);
 }
 
-// ----- quote endpoint -----
-// expects JSON: { pickup, dropoff, when, pax, luggage }
+// --- Quote (auth enforced here) ---
 app.post('/api/quote', async (req, res) => {
   try {
+    if (!API_KEY) {
+      return res.status(500).json({ ok: false, error: 'Server missing LMS_API_KEY' });
+    }
+    const incomingKey = (req.get('LMS-Api-Key') || '').trim();
+    if (incomingKey !== API_KEY) {
+      return res.status(401).json({ ok: false, error: 'Unauthorized' });
+    }
+
     const { pickup, dropoff, when, pax, luggage } = req.body || {};
+
     if (!pickup || !dropoff) {
       return res.status(400).json({ ok: false, error: 'pickup and dropoff are required' });
     }
 
-    const dist = await getDistanceKmAndDuration(pickup, dropoff);
-    const priced = priceFrom(dist.distanceKm, pax, luggage);
-    priced.breakdown.distanceSource = dist.distanceSource;
-    priced.breakdown.durationMin = dist.durationMin;
+    // Distance lookup
+    let distanceKm, durationMin, distanceSource;
+    if (MAPS_KEY) {
+      try {
+        const g = await googleDistanceKmAndMinutes(pickup, dropoff);
+        distanceKm   = g.distanceKm;
+        durationMin  = g.durationMin;
+        distanceSource = 'google';
+      } catch (err) {
+        console.warn('Google distance failed, falling back:', err.message);
+        distanceKm = roughDistanceKm(pickup, dropoff);
+        durationMin = null;
+        distanceSource = 'rough';
+      }
+    } else {
+      distanceKm = roughDistanceKm(pickup, dropoff);
+      durationMin = null;
+      distanceSource = 'rough';
+    }
+
+    const total = priceQuote({ distanceKm, pax, luggage });
 
     return res.json({
       ok: true,
       quote: {
         currency: 'AUD',
-        total: priced.total,
-        breakdown: priced.breakdown,
-        pickup, dropoff, when, pax, luggage
+        total,
+        breakdown: {
+          base: 65,
+          perKm: 2.2,
+          distanceKm: round2(distanceKm),
+          distanceSource,
+          perPax: 5,
+          perBag: 2,
+          durationMin
+        },
+        pickup,
+        dropoff,
+        when,
+        pax,
+        luggage
       }
     });
   } catch (err) {
-    console.error('quote error:', err);
+    console.error('Quote error:', err);
     res.status(500).json({ ok: false, error: 'Internal error' });
   }
 });
 
-// ----- boot -----
+// --- Start ---
 app.listen(PORT, () => {
-  console.log(`API listening on ${PORT}`);
+  console.log(`API listening on :${PORT}`);
 });
-
