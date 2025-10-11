@@ -47,15 +47,17 @@ app.set('trust proxy', 1);
 const limiterQuote = rateLimit({ windowMs: 15 * 60 * 1000, max: 60 }); // 60 / 15m
 const limiterBook  = rateLimit({ windowMs: 15 * 60 * 1000, max: 20 }); // 20 / 15m
 
-/* -------------------- Google Distance Matrix helper -------------------- */
 const GOOGLE_MAPS_KEY = process.env.GOOGLE_MAPS_KEY || '';
-console.log('Google Maps key present:', Boolean(GOOGLE_MAPS_KEY)); // should be true when env var is set on Render
+console.log('Google Maps key present:', Boolean(GOOGLE_MAPS_KEY));
 
 async function getDistanceDurationKm(pickup, dropoff) {
   if (!GOOGLE_MAPS_KEY) return { ok: false, reason: 'no_key' };
 
+  // hard cap to avoid proxy timeouts -> 5s
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort('timeout'), 5000);
+
   try {
-    // Classic Distance Matrix API (simple + reliable)
     const params = new URLSearchParams({
       origins: pickup,
       destinations: dropoff,
@@ -63,35 +65,34 @@ async function getDistanceDurationKm(pickup, dropoff) {
       units: 'metric',
       region: 'au',
     });
-
     const url = 'https://maps.googleapis.com/maps/api/distancematrix/json?' + params.toString();
-    const resp = await fetch(url, { method: 'GET', headers: { 'Accept': 'application/json' } });
-    if (!resp.ok) {
-      return { ok: false, reason: `http_${resp.status}` };
-    }
+
+    const resp = await fetch(url, {
+      method: 'GET',
+      headers: { 'Accept': 'application/json' },
+      signal: controller.signal,
+    });
+
+    if (!resp.ok) return { ok: false, reason: `http_${resp.status}` };
     const data = await resp.json();
 
-    // Possible top-level statuses: OK, OVER_DAILY_LIMIT, REQUEST_DENIED, INVALID_REQUEST, etc.
     if (data.status !== 'OK') {
       return { ok: false, reason: `api_${data.status || 'unknown'}`, error_message: data.error_message };
     }
     const el = data.rows?.[0]?.elements?.[0];
-    if (!el || el.status !== 'OK') {
-      return { ok: false, reason: `element_${el?.status || 'unknown'}` };
-    }
+    if (!el || el.status !== 'OK') return { ok: false, reason: `element_${el?.status || 'unknown'}` };
 
     const meters = Number(el.distance?.value || 0);
     const seconds = Number(el.duration?.value || 0);
-    if (!meters || !seconds) {
-      return { ok: false, reason: 'missing_values' };
-    }
+    if (!meters || !seconds) return { ok: false, reason: 'missing_values' };
 
-    const km = meters / 1000;
-    const durationMin = Math.round(seconds / 60);
-    return { ok: true, distanceKm: km, durationMin };
+    return { ok: true, distanceKm: meters / 1000, durationMin: Math.round(seconds / 60) };
   } catch (err) {
-    console.warn('DistanceMatrix fetch error:', err?.message || err);
-    return { ok: false, reason: 'exception' };
+    const r = err?.name === 'AbortError' ? 'timeout' : 'exception';
+    console.warn('DistanceMatrix fetch error:', r, err?.message || err);
+    return { ok: false, reason: r };
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
