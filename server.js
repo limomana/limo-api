@@ -9,21 +9,18 @@ const cors = require('cors');
 
 const app = express();
 
-/* -------------------- Env -------------------- */
-const GOOGLE_MAPS_KEY = process.env.GOOGLE_MAPS_KEY || null;
-
 /* -------------------- CORS (place FIRST) -------------------- */
 const allowedOrigins = [
   'https://limomanagementsys.com.au',
   'https://www.limomanagementsys.com.au',
 ];
 
-// help caches vary on Origin so responses aren't mixed
+// Help caches vary on Origin so responses aren't mixed
 app.use((req, res, next) => { res.setHeader('Vary', 'Origin'); next(); });
 
 const corsOptions = {
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true); // server-to-server / curl
+    if (!origin) return cb(null, true); // server-to-server / curl / PowerShell
     if (allowedOrigins.includes(origin)) return cb(null, true);
     return cb(new Error('Not allowed by CORS'));
   },
@@ -34,7 +31,7 @@ const corsOptions = {
   optionsSuccessStatus: 204,
 };
 
-// answer ALL preflights, then apply CORS
+// Answer ALL preflights, then apply CORS
 app.options('*', cors(corsOptions));
 app.use(cors(corsOptions));
 
@@ -43,46 +40,59 @@ app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('combined'));
 
-// if behind a proxy/CDN (Render/Cloudflare), trust the first proxy hop
+// If behind a proxy/CDN (Render/Cloudflare), trust the first proxy hop
 app.set('trust proxy', 1);
 
 /* -------------------- Rate limits -------------------- */
 const limiterQuote = rateLimit({ windowMs: 15 * 60 * 1000, max: 60 }); // 60 / 15m
 const limiterBook  = rateLimit({ windowMs: 15 * 60 * 1000, max: 20 }); // 20 / 15m
 
-/* -------------------- Distance helpers (Google Distance Matrix) -------------------- */
-async function fetchJsonWithTimeout(url, ms = 6000) {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), ms);
+/* -------------------- Google Distance Matrix helper -------------------- */
+const GOOGLE_MAPS_KEY = process.env.GOOGLE_MAPS_KEY || '';
+console.log('Google Maps key present:', Boolean(GOOGLE_MAPS_KEY)); // should be true when env var is set on Render
+
+async function getDistanceDurationKm(pickup, dropoff) {
+  if (!GOOGLE_MAPS_KEY) return { ok: false, reason: 'no_key' };
+
   try {
-    const res = await fetch(url, { signal: ctrl.signal });
-    clearTimeout(timer);
-    const data = await res.json().catch(() => ({}));
-    return { ok: res.ok, status: res.status, data };
-  } catch (e) {
-    clearTimeout(timer);
-    return { ok: false, status: 0, data: null };
+    // Classic Distance Matrix API (simple + reliable)
+    const params = new URLSearchParams({
+      origins: pickup,
+      destinations: dropoff,
+      key: GOOGLE_MAPS_KEY,
+      units: 'metric',
+      region: 'au',
+    });
+
+    const url = 'https://maps.googleapis.com/maps/api/distancematrix/json?' + params.toString();
+    const resp = await fetch(url, { method: 'GET', headers: { 'Accept': 'application/json' } });
+    if (!resp.ok) {
+      return { ok: false, reason: `http_${resp.status}` };
+    }
+    const data = await resp.json();
+
+    // Possible top-level statuses: OK, OVER_DAILY_LIMIT, REQUEST_DENIED, INVALID_REQUEST, etc.
+    if (data.status !== 'OK') {
+      return { ok: false, reason: `api_${data.status || 'unknown'}`, error_message: data.error_message };
+    }
+    const el = data.rows?.[0]?.elements?.[0];
+    if (!el || el.status !== 'OK') {
+      return { ok: false, reason: `element_${el?.status || 'unknown'}` };
+    }
+
+    const meters = Number(el.distance?.value || 0);
+    const seconds = Number(el.duration?.value || 0);
+    if (!meters || !seconds) {
+      return { ok: false, reason: 'missing_values' };
+    }
+
+    const km = meters / 1000;
+    const durationMin = Math.round(seconds / 60);
+    return { ok: true, distanceKm: km, durationMin };
+  } catch (err) {
+    console.warn('DistanceMatrix fetch error:', err?.message || err);
+    return { ok: false, reason: 'exception' };
   }
-}
-
-async function getDistanceKmAndMinutes(pickup, dropoff) {
-  if (!GOOGLE_MAPS_KEY) return null;
-
-  const url =
-    'https://maps.googleapis.com/maps/api/distancematrix/json' +
-    `?units=metric&origins=${encodeURIComponent(pickup)}` +
-    `&destinations=${encodeURIComponent(dropoff)}` +
-    `&departure_time=now&key=${GOOGLE_MAPS_KEY}`;
-
-  const { ok, data } = await fetchJsonWithTimeout(url, 7000);
-  if (!ok || !data || data.status !== 'OK') return null;
-
-  const el = data?.rows?.[0]?.elements?.[0];
-  if (!el || el.status !== 'OK') return null;
-
-  const km = el.distance.value / 1000;
-  const minutes = Math.round(((el.duration_in_traffic?.value ?? el.duration?.value) || 0) / 60);
-  return { km, minutes };
 }
 
 /* -------------------- Routes -------------------- */
@@ -91,7 +101,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/api/ping', (req, res) => {
-  res.json({ pong: true, at: new Date().toISOString() });
+  res.json({ pong: true, at: new Date().toISOString(), mapsConfigured: Boolean(GOOGLE_MAPS_KEY) });
 });
 
 app.post('/api/quote', limiterQuote, async (req, res) => {
@@ -100,35 +110,32 @@ app.post('/api/quote', limiterQuote, async (req, res) => {
     return res.status(400).json({ ok: false, error: 'pickup, dropoff, and when are required' });
   }
 
-  // Pricing knobs
-  const base = 65;
-  const perKm = 2.2;
-  const perPax = 5 * (Number(pax || 1) - 1);
-  const perBag = 2 * Number(luggage || 0);
-
-  // Try Google first; fall back to rough estimate
+  // Try Google first
   let distanceKm = null;
   let durationMin = null;
   let distanceSource = 'rough';
 
-  try {
-    const dm = await getDistanceKmAndMinutes(pickup, dropoff);
-    if (dm) {
-      distanceKm = dm.km;
-      durationMin = dm.minutes;
-      distanceSource = 'google';
-    }
-  } catch (_) {
-    // swallow; we'll use fallback below
-  }
-
-  if (distanceKm == null || !Number.isFinite(distanceKm)) {
+  const dm = await getDistanceDurationKm(pickup, dropoff);
+  if (dm.ok) {
+    distanceKm = dm.distanceKm;
+    durationMin = dm.durationMin;
+    distanceSource = 'google';
+  } else {
+    // Log once per request why we fell back (helps you debug in Render logs)
+    console.warn('DistanceMatrix fallback:', dm.reason || 'unknown', dm.error_message ? `(${dm.error_message})` : '');
+    // Simple placeholder rough distance (until Google succeeds)
     const roughDistance = Math.max(
       5,
       Math.min(45, Math.abs(String(pickup).length - String(dropoff).length) + 10)
     );
     distanceKm = roughDistance;
   }
+
+  // Pricing
+  const base = 65;
+  const perKm = 2.2;
+  const perPax = 5 * (Number(pax || 1) - 1);
+  const perBag = 2 * Number(luggage || 0);
 
   const total = Math.round((base + perKm * distanceKm + perPax + perBag) * 100) / 100;
 
@@ -144,7 +151,7 @@ app.post('/api/quote', limiterQuote, async (req, res) => {
         distanceSource,
         perPax,
         perBag,
-        durationMin,
+        durationMin: durationMin ?? null,
       },
       pickup,
       dropoff,
