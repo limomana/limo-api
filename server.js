@@ -1,117 +1,148 @@
-// server.js  — CommonJS (no "type": "module" in package.json)
+// server.js
 'use strict';
 
-// ---- Imports (declare ONCE)
 const express = require('express');
-const cors = require('cors');
 
-console.log('LMS_API_KEY present:', Boolean(process.env.LMS_API_KEY), 
-            'len:', (process.env.LMS_API_KEY || '').trim().length);
-
-// ---- App
 const app = express();
-const PORT = process.env.PORT || 10000;
-
-// Useful if behind a proxy (Render)
-app.set('trust proxy', 1);
-
-// ---- Core middleware (declare ONCE)
 app.use(express.json());
 
-// CORS: allow your WP front-end & the app domain
-app.use(
-  cors({
-    origin: [
-      'https://limomanagementsys.com.au',
-      'https://www.limomanagementsys.com.au',
-      'https://app.limomanagementsys.com.au',
-    ],
-  })
-);
+// ----- config / env -----
+const PORT = process.env.PORT || 3000;
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'https://limomanagementsys.com.au';
+const EXPECTED_KEY = (process.env.LMS_API_KEY || '').trim();
+const GOOGLE_MAPS_API_KEY = (process.env.GOOGLE_MAPS_API_KEY || '').trim();
 
-// Optional: attach request id for quick log correlation
-app.use((req, _res, next) => {
-  req.debugId = req.get('X-Debug-ID') || '';
+// A little startup visibility (does NOT print secrets)
+console.log('LMS_API_KEY present:', !!EXPECTED_KEY, 'len:', EXPECTED_KEY.length);
+console.log('GOOGLE_MAPS_API_KEY present:', !!GOOGLE_MAPS_API_KEY);
+
+// ----- very light CORS (allow your site) -----
+app.use((req, res, next) => {
+  res.set('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
+  res.set('Vary', 'Origin');
+  res.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type, LMS-Api-Key, X-Api-Key, X-Debug-ID');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
-// --- API key guard (before /api routes) ---
-const EXPECTED_KEY = (process.env.LMS_API_KEY || '').trim();
+// Optional: log a per-request debug id if client sends one
+app.use((req, _res, next) => {
+  const did = req.get('X-Debug-ID');
+  if (did) console.log(`[${new Date().toISOString()}] req ${req.method} ${req.originalUrl} debug=${did}`);
+  next();
+});
 
+// ----- health -----
+app.get('/api/ping', (req, res) => {
+  res.json({
+    pong: true,
+    at: new Date().toISOString(),
+    mapsConfigured: !!GOOGLE_MAPS_API_KEY
+  });
+});
+
+// ----- API key guard (protect everything under /api EXCEPT /api/ping) -----
 app.use('/api', (req, res, next) => {
-  const provided = (req.get('x-api-key') || '').trim(); // header names are lowercased by Express
+  if (req.path === '/ping') return next(); // leave ping open
   if (!EXPECTED_KEY) {
-    console.error('LMS_API_KEY is NOT set on the server');
-    return res.status(500).json({ ok: false, error: 'Server misconfigured' });
+    return res.status(500).json({ ok: false, error: 'Server misconfigured (LMS_API_KEY missing)' });
   }
+  const provided = (req.get('LMS-Api-Key') || req.get('X-Api-Key') || '').trim();
   if (provided !== EXPECTED_KEY) {
-    console.warn('401 Unauthorized', {
-      debugId: req.get('x-debug-id') || null,
-      providedLen: provided.length,
-    });
     return res.status(401).json({ ok: false, error: 'Unauthorized' });
   }
   next();
 });
 
-// ---- Health
-app.get('/api/ping', (req, res) => {
-  res.json({
-    pong: true,
-    at: new Date().toISOString(),
-    mapsConfigured: !!process.env.GOOGLE_MAPS_API_KEY,
-  });
-});
+// ----- helpers -----
+async function getDistanceKmAndDuration(pickup, dropoff) {
+  // If a Google key is available, use Distance Matrix with textual origins/destinations.
+  if (GOOGLE_MAPS_API_KEY) {
+    try {
+      const params = new URLSearchParams({
+        origins: pickup,
+        destinations: dropoff,
+        units: 'metric',
+        key: GOOGLE_MAPS_API_KEY
+      });
+      const url = 'https://maps.googleapis.com/maps/api/distancematrix/json?' + params.toString();
+      const resp = await fetch(url);
+      const data = await resp.json();
 
-// ---- Quote route
-// Prefer your existing handler in ./routes/quote.js
-//   module.exports = function handler(req, res) { ... }
-let quoteMounted = false;
-try {
-  const quoteHandler = require('./routes/quote');
-  if (typeof quoteHandler === 'function') {
-    app.post('/api/quote', quoteHandler);
-    quoteMounted = true;
-    console.log('Mounted /api/quote from routes/quote.js');
-  } else if (quoteHandler && typeof quoteHandler.default === 'function') {
-    app.post('/api/quote', quoteHandler.default);
-    quoteMounted = true;
-    console.log('Mounted /api/quote from routes/quote.js (default export)');
+      if (data.status === 'OK' &&
+          data.rows &&
+          data.rows[0] &&
+          data.rows[0].elements &&
+          data.rows[0].elements[0] &&
+          data.rows[0].elements[0].status === 'OK') {
+        const el = data.rows[0].elements[0];
+        const distanceKm = (el.distance.value || 0) / 1000; // meters -> km
+        const durationMin = Math.round((el.duration.value || 0) / 60); // secs -> mins
+        return { distanceKm, durationMin, distanceSource: 'google' };
+      }
+      console.warn('DistanceMatrix returned non-OK:', JSON.stringify(data));
+    } catch (e) {
+      console.warn('DistanceMatrix error:', e);
+    }
   }
-} catch (err) {
-  console.warn('No ./routes/quote.js found; using fallback 501 handler.');
+
+  // Fallback rough guess if Google failed/not configured
+  return { distanceKm: 16, durationMin: null, distanceSource: 'rough' };
 }
 
-// Fallback (only if no handler was mounted)
-if (!quoteMounted) {
-  app.post('/api/quote', (req, res) => {
-    return res.status(501).json({
-      ok: false,
-      error:
-        'Quote handler not attached. Create ./routes/quote.js and export a function (req, res) to handle /api/quote.',
-      sample: {
-        pickup: 'Brisbane Airport',
-        dropoff: 'South Bank',
-        when: '2025-10-15T10:30',
-        pax: 2,
-        luggage: 1,
-      },
+function priceFrom(distanceKm, pax, luggage) {
+  const base = 65;
+  const perKm = 2.2;
+  const perPax = 5;   // charged for extra passengers after the first
+  const perBag = 2;
+
+  const extraPax = Math.max((Number(pax) || 0) - 1, 0);
+  const bags = Number(luggage) || 0;
+
+  const total = base + (perKm * distanceKm) + (perPax * extraPax) + (perBag * bags);
+  return {
+    total: Number(total.toFixed(2)),
+    breakdown: {
+      base, perKm, distanceKm: Number(distanceKm.toFixed(3)),
+      distanceSource: null, // fill by caller
+      perPax, perBag,
+      durationMin: null     // fill by caller
+    }
+  };
+}
+
+// ----- quote endpoint -----
+// expects JSON: { pickup, dropoff, when, pax, luggage }
+app.post('/api/quote', async (req, res) => {
+  try {
+    const { pickup, dropoff, when, pax, luggage } = req.body || {};
+    if (!pickup || !dropoff) {
+      return res.status(400).json({ ok: false, error: 'pickup and dropoff are required' });
+    }
+
+    const dist = await getDistanceKmAndDuration(pickup, dropoff);
+    const priced = priceFrom(dist.distanceKm, pax, luggage);
+    priced.breakdown.distanceSource = dist.distanceSource;
+    priced.breakdown.durationMin = dist.durationMin;
+
+    return res.json({
+      ok: true,
+      quote: {
+        currency: 'AUD',
+        total: priced.total,
+        breakdown: priced.breakdown,
+        pickup, dropoff, when, pax, luggage
+      }
     });
-  });
-}
-
-// ---- 404 for unknown API routes
-app.use('/api/*', (_req, res) => {
-  res.status(404).json({ ok: false, error: 'Not found' });
+  } catch (err) {
+    console.error('quote error:', err);
+    res.status(500).json({ ok: false, error: 'Internal error' });
+  }
 });
 
-// ---- Error handler
-app.use((err, req, res, _next) => {
-  console.error(`[${req.debugId}]`, err);
-  res.status(500).json({ ok: false, error: 'Server error' });
-});
-
-// ---- Start
+// ----- boot -----
 app.listen(PORT, () => {
   console.log(`API listening on ${PORT}`);
 });
+
