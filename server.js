@@ -1,247 +1,209 @@
-'use strict';
+// server.js
+// Single-file Express API for Limo Management Systems
 
-// --- Optional: load .env locally (won't crash if not installed) ---
-try { require('dotenv').config(); } catch (_) {}
+// ========== Core ==========
+const express = require('express');
+const crypto  = require('crypto');
 
-// --- Core ---
-const express = require('express');            // ← only once
+// Create app and JSON parsing (KEEP ONLY ONE require/express + app.use)
 const app = express();
 app.use(express.json());
-app.use(express.json());
-const crypto = require('crypto');
 
-// Single source of truth
-const SERVER_KEY = (process.env.LMS_API_KEY || '').trim();
-const serverFp = SERVER_KEY ? crypto.createHash('sha256').update(SERVER_KEY).digest('hex').slice(0, 12) : 'none';
-
-console.log('Auth startup:',
-  'LMS_API_KEY present=', Boolean(SERVER_KEY),
-  'len=', SERVER_KEY.length,
-  'fp=', serverFp
-);
-
+// ========== Basic CORS (no extra deps) ==========
+const ALLOWED_ORIGINS = [
+  'https://limomanagementsys.com.au',
+  'https://app.limomanagementsys.com.au'
+];
 app.use((req, res, next) => {
-  const clientKey = (req.get('LMS_API_KEY') || '').trim();
-  const clientFp = clientKey ? crypto.createHash('sha256').update(clientKey).digest('hex').slice(0, 12) : 'none';
-
-  console.log('[auth]',
-    'clientPresent=', Boolean(clientKey),
-    'clientLen=', clientKey.length,
-    'clientFp=', clientFp,
-    'match=', clientKey === SERVER_KEY
-  );
-
-  if (!SERVER_KEY) return res.status(500).json({ ok:false, error:'Server key not configured' });
-  if (clientKey !== SERVER_KEY) return res.status(401).json({ ok:false, error:'Unauthorized' });
-  next();
-});
-
-// ==== AUTH GUARD (single source of truth) ====
-const SERVER_KEY = (process.env.LMS_API_KEY || '').trim();
-
-// one-time startup sanity print (safe: no key value)
-console.log(
-  'LMS_API_KEY present:', Boolean(SERVER_KEY),
-  'len:', SERVER_KEY.length
-);
-
-app.use((req, res, next) => {
-  // Only accept the header name LMS_API_KEY
-  const clientKey = (req.get('LMS_API_KEY') || '').trim();
-
-  // lightweight visibility without leaking the key
-  console.log('[auth]',
-    'headerPresent=', Boolean(clientKey),
-    'headerLen=', clientKey.length,
-    'valid=', clientKey === SERVER_KEY
-  );
-
-  if (!SERVER_KEY) {
-    return res.status(500).json({ ok:false, error:'Server key not configured' });
+  const origin = req.headers.origin;
+  if (ALLOWED_ORIGINS.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
   }
-  if (clientKey !== SERVER_KEY) {
-    return res.status(401).json({ ok:false, error:'Unauthorized' });
-  }
-  next();
-});
-
-app.get('/api/diag/auth', (req, res) => {
-  const clientKey = (req.get('LMS_API_KEY') || '').trim();
-  res.json({
-    ok: true,
-    serverKeyPresent: Boolean(SERVER_KEY),
-    serverKeyLen: SERVER_KEY.length,
-    serverKeyFp: serverFp,
-    clientKeyPresent: Boolean(clientKey),
-    clientKeyLen: clientKey.length,
-    clientKeyFp: clientKey ? crypto.createHash('sha256').update(clientKey).digest('hex').slice(0,12) : null,
-    match: clientKey === SERVER_KEY
-  });
-});
-// Your routes (these can come after the auth block)
-app.get('/api/ping', (req, res) => res.json({ pong: true }));
-app.post('/api/quote', /* your handler */);
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('API listening on', PORT));
-
-// --- Config / Env ---
-const PORT       = process.env.PORT || 10000;
-const API_KEY    = (process.env.LMS_API_KEY || '').trim();
-const MAPS_KEY   = (process.env.GOOGLE_MAPS_KEY || '').trim();
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'https://limomanagementsys.com.au';
-
-// One-time startup visibility (mask values)
-console.log(
-  'LMS_API_KEY present:', Boolean(API_KEY), 'len:', API_KEY.length,
-  'GOOGLE_MAPS_KEY present:', Boolean(MAPS_KEY), 'len:', MAPS_KEY.length
-);
-
-// --- Minimal CORS (match your site) ---
-app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, LMS-Api-Key, X-Debug-ID');
+  // Include the exact header name users will send:
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, LMS_API_KEY, X-Debug-ID');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
-// --- Health ---
+// ========== Env & Startup Logs ==========
+const PORT = process.env.PORT || 10000; // Render usually injects a port
+const SERVER_KEY_RAW = (process.env.LMS_API_KEY || '').trim();
+const GOOGLE_MAPS_KEY = (process.env.GOOGLE_MAPS_KEY || '').trim();
+
+function fp(s) {
+  return crypto.createHash('sha256').update((s || '').trim()).digest('hex').slice(0, 10);
+}
+
+console.log('[startup] LMS_API_KEY present:', Boolean(SERVER_KEY_RAW), 'len:', SERVER_KEY_RAW.length);
+console.log('[startup] GOOGLE_MAPS_KEY present:', Boolean(GOOGLE_MAPS_KEY));
+
+// ========== Public routes (no auth) ==========
 app.get('/api/ping', (req, res) => {
   res.json({
     pong: true,
     at: new Date().toISOString(),
-    mapsConfigured: Boolean(MAPS_KEY)
+    mapsConfigured: Boolean(GOOGLE_MAPS_KEY)
   });
 });
 
-// --- Helpers ---
-function round2(n) { return Math.round(n * 100) / 100; }
+// Helpful diag so you can verify header vs server env quickly
+app.get('/api/diag/auth', (req, res) => {
+  const clientKey =
+    req.get('LMS_API_KEY') ??
+    req.get('lms_api_key') ??
+    req.get('lms-api-key') ?? // tolerate variants silently
+    '';
 
-function roughDistanceKm(pickup, dropoff) {
-  // Simple fallback when no Google Maps key is configured or API fails.
+  const ok = Boolean(SERVER_KEY_RAW) && clientKey && (SERVER_KEY_RAW === clientKey.trim());
+
+  res.json({
+    ok,
+    match: ok,
+    server: {
+      hasKey: Boolean(SERVER_KEY_RAW),
+      fp: fp(SERVER_KEY_RAW)
+    },
+    client: {
+      present: Boolean(clientKey),
+      fp: fp(clientKey)
+    }
+  });
+});
+
+// ========== Auth middleware (protect everything below) ==========
+const AUTH_WHITELIST = new Set(['/api/ping', '/api/diag/auth']);
+app.use((req, res, next) => {
+  if (AUTH_WHITELIST.has(req.path)) return next();
+
+  const clientKey =
+    req.get('LMS_API_KEY') ??
+    req.get('lms_api_key') ??
+    req.get('lms-api-key') ?? '';
+
+  const valid = Boolean(SERVER_KEY_RAW) && clientKey && (SERVER_KEY_RAW === clientKey.trim());
+  if (!valid) {
+    return res.status(401).json({ ok: false, error: 'Unauthorized' });
+  }
+  next();
+});
+
+// ========== Helpers ==========
+function calcTotal({ distanceKm, durationMin, pax, luggage }) {
+  // Pricing model (matches your earlier examples):
+  const base = 65;
+  const perKm = 2.2;
+  const perPax = 5;      // flat add-on (NOT multiplied per pax)
+  const perBag = 2;      // multiplied by luggage count
+
+  const total =
+    base +
+    perKm * distanceKm +
+    perPax +
+    perBag * (Number(luggage) || 0);
+
+  return {
+    total: Math.round(total * 100) / 100,
+    breakdown: { base, perKm, distanceKm, distanceSource: null, perPax, perBag, durationMin }
+  };
+}
+
+async function getDistanceViaGoogle(pickup, dropoff) {
+  const url = new URL('https://maps.googleapis.com/maps/api/distancematrix/json');
+  url.searchParams.set('origins', pickup);
+  url.searchParams.set('destinations', dropoff);
+  url.searchParams.set('departure_time', 'now');
+  url.searchParams.set('key', GOOGLE_MAPS_KEY);
+
+  const r = await fetch(url.toString(), { method: 'GET' });
+  if (!r.ok) throw new Error(`Maps HTTP ${r.status}`);
+  const data = await r.json();
+
+  const row = data?.rows?.[0];
+  const el = row?.elements?.[0];
+  if (!el || el.status !== 'OK') {
+    throw new Error(`Maps element status: ${el?.status || 'Unknown'}`);
+  }
+  const meters = el.distance?.value ?? 0;
+  const seconds = el.duration_in_traffic?.value ?? el.duration?.value ?? 0;
+  const km = meters / 1000;
+  const min = seconds ? Math.round(seconds / 60) : null;
+
+  return { distanceKm: km, durationMin: min, source: 'google' };
+}
+
+function roughDistance(pickup, dropoff) {
+  // “Good enough” fallback if Google fails/missing.
+  // Keep your common case consistent with earlier results:
   const p = (pickup || '').toLowerCase();
   const d = (dropoff || '').toLowerCase();
-
-  // Your common lane:
-  if (p.includes('brisbane airport') && d.includes('south bank') ||
-      d.includes('brisbane airport') && p.includes('south bank')) {
-    return 16; // matches earlier results
+  if (p.includes('brisbane airport') && d.includes('south bank')) {
+    return { distanceKm: 16, durationMin: null, source: 'rough' };
   }
-  return 10;   // generic fallback
+  // Generic fallback
+  return { distanceKm: 12, durationMin: null, source: 'rough' };
 }
 
-async function googleDistanceKmAndMinutes(pickup, dropoff) {
-  // Uses Google Directions API (driving) via global fetch (Node 18+)
-  const params = new URLSearchParams({
-    origin: pickup,
-    destination: dropoff,
-    mode: 'driving',
-    key: MAPS_KEY
-  });
-  const url = `https://maps.googleapis.com/maps/api/directions/json?${params.toString()}`;
-  const resp = await fetch(url);
-  if (!resp.ok) throw new Error(`Google HTTP ${resp.status}`);
-  const data = await resp.json();
-
-  if (!data.routes || !data.routes.length) {
-    throw new Error('No routes returned');
-  }
-  const leg = data.routes[0].legs && data.routes[0].legs[0];
-  if (!leg || !leg.distance || !leg.duration) {
-    throw new Error('No legs/distance/duration');
-  }
-  const distanceKm  = leg.distance.value / 1000; // meters → km
-  const durationMin = Math.round(leg.duration.value / 60); // seconds → minutes
-  return { distanceKm, durationMin };
-}
-
-function priceQuote({ distanceKm, pax, luggage }) {
-  // Pricing model:
-  // base = 65
-  // perKm = 2.2
-  // perPax = 5 (for each pax *beyond the first*)
-  // perBag = 2 (per bag)
-  const base   = 65;
-  const perKm  = 2.2;
-  const perPax = 5;
-  const perBag = 2;
-
-  const extraPax = Math.max(0, (Number(pax) || 0) - 1);
-  const bags     = Math.max(0, Number(luggage) || 0);
-
-  const total = base + (perKm * distanceKm) + (perPax * extraPax) + (perBag * bags);
-  return round2(total);
-}
-
-// --- Quote (auth enforced here) ---
+// ========== Quote route ==========
 app.post('/api/quote', async (req, res) => {
   try {
-    if (!API_KEY) {
-      return res.status(500).json({ ok: false, error: 'Server missing LMS_API_KEY' });
-    }
-    const incomingKey = (req.get('LMS-Api-Key') || '').trim();
-    if (incomingKey !== API_KEY) {
-      return res.status(401).json({ ok: false, error: 'Unauthorized' });
-    }
-
     const { pickup, dropoff, when, pax, luggage } = req.body || {};
-
-    if (!pickup || !dropoff) {
-      return res.status(400).json({ ok: false, error: 'pickup and dropoff are required' });
+    if (!pickup || !dropoff || !when) {
+      return res.status(400).json({ ok: false, error: 'Missing pickup/dropoff/when' });
     }
 
-    // Distance lookup
     let distanceKm, durationMin, distanceSource;
-    if (MAPS_KEY) {
+
+    if (GOOGLE_MAPS_KEY) {
       try {
-        const g = await googleDistanceKmAndMinutes(pickup, dropoff);
-        distanceKm   = g.distanceKm;
-        durationMin  = g.durationMin;
-        distanceSource = 'google';
+        const g = await getDistanceViaGoogle(pickup, dropoff);
+        distanceKm = g.distanceKm;
+        durationMin = g.durationMin;
+        distanceSource = g.source;
       } catch (err) {
-        console.warn('Google distance failed, falling back:', err.message);
-        distanceKm = roughDistanceKm(pickup, dropoff);
-        durationMin = null;
-        distanceSource = 'rough';
+        console.warn('[maps-fallback]', err.message);
+        const r = roughDistance(pickup, dropoff);
+        distanceKm = r.distanceKm;
+        durationMin = r.durationMin;
+        distanceSource = r.source;
       }
     } else {
-      distanceKm = roughDistanceKm(pickup, dropoff);
-      durationMin = null;
-      distanceSource = 'rough';
+      const r = roughDistance(pickup, dropoff);
+      distanceKm = r.distanceKm;
+      durationMin = r.durationMin;
+      distanceSource = r.source;
     }
 
-    const total = priceQuote({ distanceKm, pax, luggage });
+    const pricing = calcTotal({ distanceKm, durationMin, pax, luggage });
+    pricing.breakdown.distanceKm = Math.round(distanceKm * 1000) / 1000; // nice rounding
+    pricing.breakdown.distanceSource = distanceSource;
 
-    return res.json({
+    res.json({
       ok: true,
       quote: {
         currency: 'AUD',
-        total,
-        breakdown: {
-          base: 65,
-          perKm: 2.2,
-          distanceKm: round2(distanceKm),
-          distanceSource,
-          perPax: 5,
-          perBag: 2,
-          durationMin
-        },
+        total: pricing.total,
+        breakdown: pricing.breakdown,
         pickup,
         dropoff,
         when,
-        pax,
-        luggage
+        pax: Number(pax) || 0,
+        luggage: Number(luggage) || 0
       }
     });
   } catch (err) {
-    console.error('Quote error:', err);
-    res.status(500).json({ ok: false, error: 'Internal error' });
+    console.error('[quote-error]', err);
+    res.status(500).json({ ok: false, error: 'Server error' });
   }
 });
 
-// --- Start ---
+// ========== Global error guards ==========
+process.on('unhandledRejection', (e) => console.error('[unhandledRejection]', e));
+process.on('uncaughtException', (e) => console.error('[uncaughtException]', e));
+
+// ========== Start ==========
 app.listen(PORT, () => {
-  console.log(`API listening on :${PORT}`);
+  console.log('[startup] API listening on', PORT);
 });
+
