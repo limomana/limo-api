@@ -7,7 +7,7 @@ try { require('dotenv').config(); } catch (_) {}
 const express = require('express');            // ← only once
 const app = express();
 app.use(express.json());
-
+app.use(express.json());
 const crypto = require('crypto');
 
 // Single source of truth
@@ -78,6 +78,12 @@ app.get('/api/diag/auth', (req, res) => {
     match: clientKey === SERVER_KEY
   });
 });
+// Your routes (these can come after the auth block)
+app.get('/api/ping', (req, res) => res.json({ pong: true }));
+app.post('/api/quote', /* your handler */);
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log('API listening on', PORT));
 
 // --- Config / Env ---
 const PORT       = process.env.PORT || 10000;
